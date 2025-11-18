@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""
+cryptor_gui_kyber.py
+GUI file encrypt/decrypt/keygen with Argon2id KDF, AES-256-GCM streaming and post-quantum Kyber hybrid envelope encryption (via python-oqs if available). Also supports optional X25519 hybrid combination (Kyber + X25519).
+
+Dependencies:
+	  pip install cryptography argon2_cffi PySimpleGUI tqdm
+	  Optional: pip install oqs  (requires liboqs/native libs; feature disabled if not installed)
+
+Run: python cryptor_gui_kyber.py
+"""
+	import os
+	import sys
+	import json
+	import base64
+	import struct
+	import secrets
+	import logging
+	from pathlib import Path
+
+import PySimpleGUI as sg
+from tqdm import tqdm
+
+	from cryptography.hazmat.primitives import hashes, serialization
+	from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+	from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+	from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+	from cryptography.hazmat.backends import default_backend
+	from cryptography.exceptions import InvalidTag
+	from cryptography.hazmat.primitives.asymmetric import x25519
+
+	from argon2.low_level import hash_secret_raw, Type
+
+# Try to import python-oqs for Kyber KEM support (post-quantum)
+try:
+    import oqs
+    OQS_AVAILABLE = True
+	except Exception:
+    OQS_AVAILABLE = False
+
+	# Constants
+	MAGIC = "CRYPTOR_PQC_V2"
+	SALT_SIZE = 16
+	NONCE_SIZE = 12  # for AES-GCM / ChaCha20-Poly1305 usage
+	ARGON2_TIME = 3
+	ARGON2_MEMORY_KIB = 64 * 1024
+	ARGON2_PARALLELISM = 4
+	CHUNK = 64 * 1024
+	TAG_SIZE = 16
+	BACKEND = default_backend()
+
+	logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+	
+	# Utilities
+		def derive_argon2(password: bytes, salt: bytes, time: int = ARGON2_TIME, mem_kib: int = ARGON2_MEMORY_KIB, parallelism: int = ARGON2_PARALLELISM, length: int = 32) -> bytes:
+	    "Return a raw Argon2id-derived key (requires argon2_cffi)."
+	    return hash_secret_raw(secret=password, salt=salt, time_cost=time, memory_cost=mem_kib, parallelism=parallelism, hash_len=length, type=Type.ID)
+	
+	def hkdf(shared: bytes, length: int = 32, info: bytes = b'cryptor-pqc') -> bytes:
+	    return HKDF(algorithm=hashes.SHA256(), length=length, salt=None, info=info, backend=BACKEND).derive(shared)
+	
+	def write_file_with_header(path: str, header: dict, ciphertext: bytes, tag: bytes = b''):
+		    hdr_json = json.dumps(header).encode('utf-8')
+	    with open(path, 'wb') as f:
+	        f.write(struct.pack('>I', len(hdr_json)))
+	        f.write(hdr_json)
+	        f.write(ciphertext)
+	        if tag:
+	            f.write(tag)
+	
+	def read_header_and_body(path: str):
+	    with open(path, 'rb') as f:
+	        raw = f.read(4)
+        if len(raw) != 4:
+            raise ValueError('Not a valid file (missing header).')
+        (hlen,) = struct.unpack('>I', raw)
+        hdr = f.read(hlen)
+	        header = json.loads(hdr.decode('utf-8'))
+	        body = f.read()
+	    return header, body
+	
+	# AEAD streaming with AES-GCM
+	def encrypt_stream_aes_gcm(inpath: str, outpath: str, key: bytes, header: dict):
+	    nonce = secrets.token_bytes(NONCE_SIZE)
+	    header['alg'] = 'AES-256-GCM'
+	    header['nonce'] = base64.b64encode(nonce).decode()
+	    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce), backend=BACKEND)
+	    encryptor = cipher.encryptor()
+	    total = os.path.getsize(inpath)
+	    pbar = tqdm(total=total, unit='B', unit_scale=True, desc='Encrypting')
+	    ct_acc = bytearray()
+	    with open(inpath, 'rb') as fin:
+	        while True:
+            chunk = fin.read(CHUNK)
+            if not chunk:
+                break
+            ct = encryptor.update(chunk)
+            if ct:
+                ct_acc.extend(ct)
+            pbar.update(len(chunk))
+	        encryptor.finalize()
+	        tag = encryptor.tag
+	    pbar.close()
+	    write_file_with_header(outpath, header, bytes(ct_acc), tag)
+	
+		def decrypt_stream_aes_gcm(inpath: str, outpath: str, key: bytes):
+	    header, body = read_header_and_body(inpath)
+	    if header.get('alg') != 'AES-256-GCM':
+	        raise ValueError('Wrong algorithm in file')
+	    nonce = base64.b64decode(header['nonce'])
+	    tag = body[-TAG_SIZE:]
+	    ciphertext = body[:-TAG_SIZE]
+	    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag), backend=BACKEND)
+	    decryptor = cipher.decryptor()
+	    total = len(ciphertext)
+  	  pbar = tqdm(total=total, unit='B', unit_scale=True, desc='Decrypting')
+  	  with open(outpath, 'wb') as fout:
+        idx = 0
+        while idx < total:
+            chunk = ciphertext[idx: idx + CHUNK]
+            pt = decryptor.update(chunk)
+            if pt:
+                fout.write(pt)
+            idx += len(chunk)
+            pbar.update(len(chunk))
+      		  try:
+            decryptor.finalize()
+     	   except InvalidTag:
+            pbar.close()
+            fout.close()
+            os.remove(outpath)
+            raise InvalidTag('Authentication failed')
+    pbar.close()
+
+# ChaCha20-Poly1305 simple mode (non-streaming here)
+def encrypt_chacha(inpath: str, outpath: str, key: bytes, header: dict):
+   	 header['alg'] = 'ChaCha20-Poly1305'
+  	  nonce = secrets.token_bytes(12)
+  	  header['nonce'] = base64.b64encode(nonce).decode()
+  	  a = ChaCha20Poly1305(key)
+  	  with open(inpath, 'rb') as f:
+        pt = f.read()
+   	 ct = a.encrypt(nonce, pt, None)
+  	  write_file_with_header(outpath, header, ct)
+
+def decrypt_chacha(inpath: str, outpath: str, key: bytes):
+  	  header, body = read_header_and_body(inpath)
+  	  if header.get('alg') != 'ChaCha20-Poly1305':
+        raise ValueError('Wrong algorithm in file')
+  	  nonce = base64.b64decode(header['nonce'])
+  	  a = ChaCha20Poly1305(key)
+  	  pt = a.decrypt(nonce, body, None)
+  	  with open(outpath, 'wb') as f:
+        f.write(pt)
+
+	# Kyber envelope helpers (using python-oqs if available)
+	def kyber_encapsulate(recipient_pub_b64: str, kem_name: str = 'Kyber768') -> (bytes, bytes):
+	    if not OQS_AVAILABLE:
+        raise RuntimeError('python-oqs not available')
+ 	   rec_raw = base64.b64decode(recipient_pub_b64)
+ 	   with oqs.KeyEncapsulation(kem_name) as kem:
+        ct, shared = kem.encap(rec_raw)
+	    return ct, shared
+
+	def kyber_decapsulate(kem_ct_b64: str, recipient_priv_b64: str, kem_name: str = 'Kyber768') -> bytes:
+	    if not OQS_AVAILABLE:
+        raise RuntimeError('python-oqs not available')
+ 	   ct = base64.b64decode(kem_ct_b64)
+	    sk_raw = base64.b64decode(recipient_priv_b64)
+	    with oqs.KeyEncapsulation(kem_name) as kem:
+	        shared = kem.decap(ct, sk_raw)
+    return shared
+
+	# X25519 helpers
+	def x25519_shared_with_recipient(recipient_pub_b64: str) -> (bytes, bytes):
+  	  rec_raw = base64.b64decode(recipient_pub_b64)
+  	  recip_pub = x25519.X25519PublicKey.from_public_bytes(rec_raw)
+  	  eph_priv = x25519.X25519PrivateKey.generate()
+  	  eph_pub = eph_priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    shared = eph_priv.exchange(recip_pub)
+    return eph_pub, shared
+
+	def x25519_decompose_shared(eph_pub_b64: str, recipient_priv_b64: str) -> bytes:
+    eph_pub = base64.b64decode(eph_pub_b64)
+    priv_raw = base64.b64decode(recipient_priv_b64)
+    priv = x25519.X25519PrivateKey.from_private_bytes(priv_raw)
+    shared = priv.exchange(x25519.X25519PublicKey.from_public_bytes(eph_pub))
+    return shared
+
+# Keyfile generator
+	def generate_keyfile(path: str, bits: int = 256):
+    key = secrets.token_bytes(bits // 8)
+    with open(path, 'wb') as f:
+        f.write(key)
+    os.chmod(path, 0o600)
+
+# If OQS_AVAILABLE provide helper to generate Kyber keypair
+	def kyber_generate_keypair(kem_name: str = 'Kyber768') -> (str, str):
+    if not OQS_AVAILABLE:
+        raise RuntimeError('python-oqs not available')
+    	with oqs.KeyEncapsulation(kem_name) as kem:
+        pub, priv = kem.generate_keypair()
+   	 return base64.b64encode(pub).decode(), base64.b64encode(priv).decode()
+
+# X25519 keypair generator (raw base64)
+def x25519_generate_keypair() -> (str, str):
+   	 priv = x25519.X25519PrivateKey.generate()
+	    pub = priv.public_key()
+	    priv_raw = priv.private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
+	    pub_raw = pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+	    return base64.b64encode(pub_raw).decode(), base64.b64encode(priv_raw).decode()
+
+# GUI layout
+sg.theme('DarkGrey13')
+layout = [
+	    [sg.Text('Input file'), sg.Input(key='-IN-'), sg.FileBrowse()],
+	    [sg.Text('Output file'), sg.Input(key='-OUT-'), sg.FileSaveAs()],
+	    [sg.Frame('Key mode', [[sg.Radio('Passphrase (Argon2id)', 'KM', key='-KM_PASS-', default=True), sg.Radio('Raw keyfile', 'KM', key='-KM_KEYFILE-'), 			sg.Radio('Recipient public key (hybrid/kyber)', 'KM', key='-KM_KYBER-')]])],
+	    [sg.Text('Passphrase'), sg.Input(key='-PASS-', password_char='*')],
+	    [sg.Text('Keyfile'), sg.Input(key='-KEYFILE-'), sg.FileBrowse()],
+	    [sg.Text('Recipient Kyber public key (base64)'), sg.Input(key='-RECIP_KYBER_PUB-')],
+	    [sg.Text('Recipient Kyber private key (base64; for decrypt)'), sg.Input(key='-RECIP_KYBER_PRIV-')],
+	    [sg.Text('Recipient X25519 public key (base64, optional for hybrid)'), sg.Input(key='-RECIP_X25519_PUB-')],
+	    [sg.Text('Recipient X25519 private key (base64; for decrypt hybrid)'), sg.Input(key='-RECIP_X25519_PRIV-')],
+	    [sg.Text('Algorithm'), sg.Combo(['AES-256-GCM', 'ChaCha20-Poly1305'], default_value='AES-256-GCM', key='-ALG-')],
+	    [sg.Checkbox('Use post-quantum Kyber hybrid (requires python-oqs)', key='-USE_KYBER-'), sg.Checkbox('Also use X25519 hybrid (Kyber+X25519)', key='-USE_X25519-')],
+	    [sg.Button('Gen Kyber keypair'), sg.Button('Gen X25519 keypair'), sg.Button('Encrypt'), sg.Button('Decrypt'), sg.Button('Keygen 256'), sg.Button('Exit')],
+	    [sg.Multiline('', size=(100,14), key='-LOG-')]
+]
+
+		window = sg.Window('Cryptor GUI - PQC Kyber+X25519', layout, resizable=True)
+
+def log(msg: str):
+    window['-LOG-'].print(msg)
+
+	while True:
+    		event, values = window.read()
+   		 if event in (sg.WIN_CLOSED, 'Exit'):
+      		  break
+    try:
+        if event == 'Keygen 256':
+            path = sg.popup_get_file('Save keyfile', save_as=True, default_extension='.key')
+            if path:
+                generate_keyfile(path, 256)
+                log(f'Keyfile written: {path}')
+        elif event == 'Gen Kyber keypair':
+            if not OQS_AVAILABLE:
+                sg.popup('python-oqs not available; cannot generate Kyber keypair')
+                continue
+            pub_b64, priv_b64 = kyber_generate_keypair()
+            sg.popup('Kyber keypair generated', 'Public (base64):', pub_b64, 'Private (base64): (store safely)', priv_b64)
+            log('Generated Kyber keypair (shown in popup)')
+        elif event == 'Gen X25519 keypair':
+            pub_b64, priv_b64 = x25519_generate_keypair()
+            sg.popup('X25519 keypair generated', 'Public (base64):', pub_b64, 'Private (base64): (store safely)', priv_b64)
+            log('Generated X25519 keypair (shown in popup)')
+
+        elif event in ('Encrypt', 'Decrypt'):
+            infile = values['-IN-']
+            outfile = values['-OUT-']
+            if not infile or not outfile:
+                sg.popup('Please choose input and output files')
+                continue
+	            use_kyber = values['-USE_KYBER-']
+	            use_x25519 = values['-USE_X25519-']
+	            alg = values['-ALG-']
+	            header = {'magic': MAGIC, 'version': 2}
+	            key = None
+	
+	            if event == 'Encrypt':
+                if values['-KM_PASS-']:
+                    pwd = values['-PASS-'] or sg.popup_get_text('Passphrase', password_char='*')
+                    if pwd is None:
+                        continue
+                    salt = secrets.token_bytes(SALT_SIZE)
+                    header['kdf'] = 'argon2id'
+                    header['salt'] = base64.b64encode(salt).decode()
+                    header['argon2'] = {'time': ARGON2_TIME, 'mem_kib': ARGON2_MEMORY_KIB, 'parallelism': ARGON2_PARALLELISM}
+                    key = derive_argon2(pwd.encode('utf-8'), salt)
+                elif values['-KM_KEYFILE-']:
+                    kf = values['-KEYFILE-'] or sg.popup_get_file('Keyfile...')
+                    if not kf:
+                        continue
+                    with open(kf, 'rb') as f:
+                        key = f.read()
+                    header['kdf'] = 'raw'
+                elif values['-KM_KYBER-']:
+                    if not use_kyber:
+                        sg.popup('Enable \"Use post-quantum Kyber\" checkbox to use Kyber hybrid mode')
+                        continue
+                    if not OQS_AVAILABLE:
+                        sg.popup('python-oqs (liboqs) not available on this system. Install liboqs/python-oqs to enable Kyber.')
+                        continue
+                    recip_kyber = values['-RECIP_KYBER_PUB-'] or sg.popup_get_text('Recipient Kyber public key (base64)')
+                    if not recip_kyber:
+                        continue
+                    kem_alg = 'Kyber768'
+                    # encapsulate to recipient kyber pub
+                    kem_ct, shared_kem = kyber_encapsulate(recip_kyber, kem_alg)
+                    header['kdf'] = 'kyber'
+                    header['kem_alg'] = kem_alg
+                    header['kem_ct'] = base64.b64encode(kem_ct).decode()
+
+                    if use_x25519:
+                        recip_x_pub = values['-RECIP_X25519_PUB-'] or sg.popup_get_text('Recipient X25519 public key (base64) for hybrid')
+                        if not recip_x_pub:
+                            sg.popup('Recipient X25519 public key required for hybrid')
+                            continue
+                        eph_pub_x, shared_x = x25519_shared_with_recipient(recip_x_pub)
+                        header['x25519_ephemeral_pub'] = base64.b64encode(eph_pub_x).decode()
+                        header['kdf'] = 'kyber+x25519'
+                        # combine the shared secrets and derive symmetric key
+                        combined = shared_kem + shared_x
+                        key = hkdf(combined, info=b'kyber+x25519')
+                    else:
+                        key = hkdf(shared_kem)
+
+                # perform encryption with selected algorithm
+                if alg == 'AES-256-GCM':
+                    encrypt_stream_aes_gcm(infile, outfile, key, header)
+                else:
+	                    if len(key) != 32:
+	                        sg.popup('ChaCha20-Poly1305 requires 32-byte key')
+	                        continue
+	                    encrypt_chacha(infile, outfile, key, header)
+	                log(f'Encrypted {infile} -> {outfile} (kdf={header.get("kdf")}, alg={header.get("alg")})')
+		
+			            else:  # Decrypt
+	                header_read, body = read_header_and_body(infile)
+	                kdf = header_read.get('kdf')
+	                key_dec = None
+	                if kdf == 'argon2id':
+	                    salt = base64.b64decode(header_read['salt'])
+                    pwd = values['-PASS-'] or sg.popup_get_text('Passphrase', password_char='*')
+                    if pwd is None:
+                        continue
+                    key_dec = derive_argon2(pwd.encode('utf-8'), salt)
+                elif kdf == 'raw':
+                    kf = values['-KEYFILE-'] or sg.popup_get_file('Keyfile...')
+                    if not kf:
+                        continue
+                    with open(kf, 'rb') as f:
+                        key_dec = f.read()
+                elif kdf in ('kyber', 'kyber+x25519'):
+                    if not OQS_AVAILABLE:
+                        sg.popup('python-oqs not available; cannot decapsulate Kyber.')
+                        continue
+                    priv_kyber_b64 = values['-RECIP_KYBER_PRIV-'] or sg.popup_get_text('Your Kyber private key (base64)')
+                    if not priv_kyber_b64:
+                        continue
+                    kem_alg = header_read.get('kem_alg', 'Kyber768')
+                    kem_ct_b64 = header_read['kem_ct']
+                    shared_kem = kyber_decapsulate(kem_ct_b64, priv_kyber_b64, kem_alg)
+                    if kdf == 'kyber+x25519':
+                        # need X25519 private to derive other half
+                        priv_x_b64 = values['-RECIP_X25519_PRIV-'] or sg.popup_get_text('Your X25519 private key (base64) for hybrid')
+                        if not priv_x_b64:
+                            sg.popup('X25519 private key required for hybrid decryption')
+                            continue
+                        eph_pub_b64 = header_read.get('x25519_ephemeral_pub')
+                        if not eph_pub_b64:
+                            raise ValueError('Missing ephemeral x25519 pub in header')
+                        shared_x = x25519_decompose_shared(eph_pub_b64, priv_x_b64)
+                        combined = shared_kem + shared_x
+                        key_dec = hkdf(combined, info=b'kyber+x25519')
+                    else:
+                        key_dec = hkdf(shared_kem)
+                else:
+                    raise ValueError('Unknown KDF/mode in file')
+
+                # write temporary file via appropriate decrypt function
+                if header_read.get('alg') == 'AES-256-GCM':
+                    decrypt_stream_aes_gcm(infile, outfile, key_dec)
+                elif header_read.get('alg') == 'ChaCha20-Poly1305':
+                    decrypt_chacha(infile, outfile, key_dec)
+                else:
+                    raise ValueError('Unknown algorithm in file')
+                log(f'Decrypted {infile} -> {outfile} (kdf={kdf})')
+
+    except InvalidTag as e:
+       		 sg.popup('Decryption failed: authentication error')
+       		 log('Decryption failed: ' + str(e))
+    except Exception as e:
+       		 sg.popup('Error', str(e))
+       		 log('Error: ' + str(e))
+
+window.close()
