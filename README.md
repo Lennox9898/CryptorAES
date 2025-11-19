@@ -1,10 +1,12 @@
 # CryptorAES
 
-- For coding beginners , students or as a target to crack AES . 
-- Do whatever you want with it.
-- Simple pythonscript using AES-128 gcm to show, how a file gets encrypted with a key .
+So my Goal with this was to find out whats 
+the Heaviest possible encryption you can can build 
+on Python before its getting unstable.
 
-## easy handling: text will go in input , keygen writes a 16B key to key.bin --> depending wether you click on decrypt.py or encrypt.py the text will go into same .txt   
-Decrypt .py file will always use key.bin value.
+turns out kyber post quantum is not. Got me the Feverdream to put every less vulnerable script into some fine tuned code wich turned out 
+to be actual working relieable tool
 
-if you want the .exe , just use pyinstaller 
+which is apart from beeing ressource-hungry 
+
+actualy broken right now 
